@@ -1,62 +1,73 @@
 <?php
+// Lấy giá trị url và referrer từ query string
 $url = $_GET['url'] ?? '';
 $referrer = $_GET['referrer'] ?? '';
+
 if (!$url) {
     http_response_code(400);
     exit("Thiếu ?url=");
 }
 
-function fetch($url, $referrer){
+// Hàm tải nội dung từ URL bằng cURL
+function fetch($url, $referrer) {
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_HEADER => false,
         CURLOPT_HTTPHEADER => [
             "Referer: $referrer",
-            "User-Agent: Mozilla/5.0"
+            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         ],
     ]);
     $data = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $ctype = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
     curl_close($ch);
-    return [$data, $code, $ctype];
+    return [$data, $httpcode, $ctype];
 }
 
+// Gọi hàm tải
 [$data, $code, $ctype] = fetch($url, $referrer);
+
 if ($code >= 400 || !$data) {
     http_response_code($code);
     exit("Lỗi $code");
 }
 
+// Xử lý nếu là m3u8
 $ext = pathinfo(parse_url($url, PHP_URL_PATH), PATHINFO_EXTENSION);
 if ($ext === 'm3u8') {
-    $base = rtrim(dirname($url), '/');
+    $parsed = parse_url($url);
+    $scheme = $parsed['scheme'] ?? 'https';
+    $host = $parsed['host'] ?? '';
+    $dir = rtrim(dirname($parsed['path']), '/');
+    $base_url = "$scheme://$host$dir";
+
     $lines = explode("\n", $data);
-    $out = "";
+    $output = '';
+
     foreach ($lines as $line) {
-        $trimmed = trim($line);
-        if ($trimmed === '' || str_starts_with($trimmed, '#')) {
-            $out .= $line . "\n";
-        } elseif (preg_match('/\.m3u8$/i', $trimmed) || preg_match('/\.ts$/i', $trimmed)) {
-            $full = preg_match('#^https?://#', $trimmed)
-                  ? $trimmed
-                  : $base . '/' . ltrim($trimmed, '/');
+        $trim = trim($line);
 
-            $rewrite = (isset($_SERVER['HTTPS']) ? "https" : "http") . "://" .
-                       $_SERVER['HTTP_HOST'] . $_SERVER['PHP_SELF'] .
-                       '?referrer=' . urlencode($referrer) .
-                       '&url=' . urlencode($full);
-
-            $out .= $rewrite . "\n";
+        if ($trim === '' || str_starts_with($trim, '#')) {
+            $output .= $line . "\n";
+        } elseif (!preg_match('#^https?://#', $trim)) {
+            // Rewrite đường dẫn tương đối
+            $full_url = $base_url . '/' . ltrim($trim, '/');
+            $self = (isset($_SERVER['HTTPS']) ? 'https' : 'http') . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['PHP_SELF'];
+            $rewrite = $self . '?referrer=' . urlencode($referrer) . '&url=' . urlencode($full_url);
+            $output .= $rewrite . "\n";
         } else {
-            $out .= $line . "\n";
+            // Giữ nguyên link tuyệt đối
+            $output .= $line . "\n";
         }
     }
 
-    header("Content-Type: application/vnd.apple.mpegurl");
-    echo $out;
+    header('Content-Type: application/vnd.apple.mpegurl');
+    echo $output;
 } else {
+    // Không phải m3u8 → trả dữ liệu như bình thường
     header("Content-Type: $ctype");
     echo $data;
 }
