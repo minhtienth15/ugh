@@ -1,93 +1,71 @@
 <?php
-$url = $_GET['url'] ?? '';
-$referrer = $_GET['referrer'] ?? '';
+error_reporting(0);
+set_time_limit(0);
+
+$url = isset($_GET['url']) ? $_GET['url'] : '';
+$ref = isset($_GET['referrer']) ? $_GET['referrer'] : '';
 
 if (!$url) {
-    http_response_code(400);
-    exit("Thiếu ?url=");
+    header("HTTP/1.1 400 Bad Request");
+    die("Missing url parameter");
 }
 
-// Hàm tải dữ liệu bằng cURL và stream trực tiếp ra trình duyệt
-function stream_proxy($url, $referrer) {
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => false,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_HEADERFUNCTION => function($ch, $header) {
-            // Ghi lại các header hợp lệ
-            if (stripos($header, 'Content-Type:') === 0 ||
-                stripos($header, 'Content-Length:') === 0 ||
-                stripos($header, 'Accept-Ranges:') === 0 ||
-                stripos($header, 'Content-Range:') === 0 ||
-                stripos($header, 'Cache-Control:') === 0) {
-                header($header);
-            }
-            return strlen($header);
-        },
-        CURLOPT_HTTPHEADER => [
-            "Referer: $referrer",
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Connection: keep-alive",
-        ],
-    ]);
+// Curl setup
+$ch = curl_init();
+curl_setopt($ch, CURLOPT_URL, $url);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
 
-    $fp = fopen('php://output', 'wb');
-    curl_setopt($ch, CURLOPT_FILE, $fp);
-    curl_exec($ch);
-    curl_close($ch);
-    fclose($fp);
+// Giữ cookie để qua các bước validate (__test, token…)
+$cookieFile = __DIR__ . "/cookie.txt";
+curl_setopt($ch, CURLOPT_COOKIEJAR, $cookieFile);
+curl_setopt($ch, CURLOPT_COOKIEFILE, $cookieFile);
+
+// Header giả lập browser
+$headers = [
+    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+];
+if ($ref) {
+    $headers[] = "Referer: $ref";
+}
+curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+
+$response = curl_exec($ch);
+$info = curl_getinfo($ch);
+curl_close($ch);
+
+if ($response === false) {
+    header("HTTP/1.1 502 Bad Gateway");
+    die("Error fetching stream");
 }
 
-// Nếu là m3u8 thì rewrite lại các dòng .ts
-if (pathinfo(parse_url($url, PHP_URL_PATH), PATHINFO_EXTENSION) === 'm3u8') {
-    [$content, $code, $ctype] = get_content($url, $referrer);
-    if ($code >= 400 || !$content) {
-        http_response_code($code);
-        exit("Lỗi $code");
-    }
+// Trả CORS header cho player web
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Headers: Origin, X-Requested-With, Content-Type, Accept");
 
-    $parsed = parse_url($url);
-    $base = $parsed['scheme'] . '://' . $parsed['host'] . rtrim(dirname($parsed['path']), '/');
+// Xác định nội dung
+$contentType = $info['content_type'];
+if (strpos($url, ".m3u8") !== false || strpos($contentType, "mpegurl") !== false) {
+    header("Content-Type: application/vnd.apple.mpegurl");
 
-    $lines = explode("\n", $content);
-    $output = '';
+    // Rewrite link .ts để đi qua proxy
+    $base = dirname($url);
+    $lines = explode("\n", $response);
+    $newLines = [];
     foreach ($lines as $line) {
-        $trim = trim($line);
-        if ($trim === '' || str_starts_with($trim, '#')) {
-            $output .= $line . "\n";
-        } elseif (!preg_match('#^https?://#', $trim)) {
-            $full = $base . '/' . ltrim($trim, '/');
-            $self = (isset($_SERVER['HTTPS']) ? 'https' : 'http') . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['PHP_SELF'];
-            $rewrite = $self . '?referrer=' . urlencode($referrer) . '&url=' . urlencode($full);
-            $output .= $rewrite . "\n";
-        } else {
-            $output .= $line . "\n";
+        $line = trim($line);
+        if ($line && !str_starts_with($line, "#")) {
+            if (!preg_match("~^https?://~", $line)) {
+                $line = $base . "/" . $line;
+            }
+            $line = $_SERVER['PHP_SELF'] . "?url=" . urlencode($line) . "&referrer=" . urlencode($ref);
         }
+        $newLines[] = $line;
     }
-
-    header('Content-Type: application/vnd.apple.mpegurl');
-    echo $output;
+    echo implode("\n", $newLines);
 } else {
-    // Stream .ts/.aac/.mp4 segment theo kiểu passthrough
-    stream_proxy($url, $referrer);
-}
-
-
-// Hàm riêng tải file (dành cho .m3u8 text)
-function get_content($url, $referrer) {
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_HEADER => false,
-        CURLOPT_HTTPHEADER => [
-            "Referer: $referrer",
-            "User-Agent: Mozilla/5.0",
-        ],
-    ]);
-    $content = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $ctype = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
-    curl_close($ch);
-    return [$content, $code, $ctype];
+    // TS segment
+    header("Content-Type: video/MP2T");
+    echo $response;
 }
